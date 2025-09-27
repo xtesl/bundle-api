@@ -115,8 +115,8 @@ def set_del_auth_credentials(
         key=cookie_key,
         value=token,
         httponly=True,
-        samesite="strict",
-        secure=False,
+        samesite="none",
+        secure=True,
         max_age=expire_time # Convert from minutes to seconds
     )
 
