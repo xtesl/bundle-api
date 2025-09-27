@@ -18,6 +18,7 @@ api_router = APIRouter()
 class PaymentRouter(BaseRouter):
     @api_router.post('/initialize')
     async def initialize(self, payment_data: InitializePayment, current_user: CurrentUser):
+        print(payment_data)
         response = make_request(
             "POST", 
             "https://api.paystack.co/transaction/initialize",
@@ -85,7 +86,7 @@ class PaymentRouter(BaseRouter):
                     )
                     
                     if response.get("status_code"):
-                        print(response["status_code"])
+                        
                         validated_purchase_info = Order.model_validate(purchase_info, update={
                                                                       "customer_id": user_id
                                                          })
