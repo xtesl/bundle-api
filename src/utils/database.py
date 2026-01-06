@@ -1,4 +1,5 @@
 from typing import Any, List, Sequence, TypeVar, Union, Optional, Type
+from datetime import datetime
 
 from sqlmodel import select, SQLModel, func
 from sqlalchemy.orm.attributes import InstrumentedAttribute
@@ -306,4 +307,64 @@ async def count_items(
 
     result = await session.exec(count_stmt)
     return result.one()
+
+
+
+
+async def sync_orders_with_external(session: AsyncSession, local_orders, external_orders):
+    """
+    Fetch external orders, update local DB only if status changed, and return synced orders.
+    """
+    
+    # Build lookup map for external orders
+    external_map = {
+        str(order['order_id']): order 
+        for order in external_orders
+    }
+    
+    # 4. Track orders that need updating
+    orders_to_save = []
+    
+    for order in local_orders:
+        if not order.external_id:
+            continue
+        
+        # Find matching external order
+        external_order = external_map.get(str(order.external_id))
+        
+        if external_order:
+            external_status = external_order['status']
+            
+            # Only update if status is different
+            if order.status != external_status:
+                order.status = external_status
+                
+                # Set completed_at if newly delivered
+                if external_status == 'delivered' and not order.completed_at:
+                    order.completed_at = datetime.fromisoformat(
+                        external_order.get('status_updated_at', datetime.utcnow().isoformat())
+                    )
+                
+                orders_to_save.append(order)
+    
+    # 5. Save only changed orders
+    if orders_to_save:
+        await save(session, orders_to_save)
+    
+    # 6. Return all local orders (with updated statuses)
+    return [
+        {
+            "id": order.id,
+            "agent_id": order.agent_id,
+            "customer_id": order.customer_id,
+            "beneficiary_number": order.beneficiary_number,
+            "status": order.status,
+            "created_at": order.created_at.isoformat(),
+            "plan_id": order.plan_id,
+            "price_paid": str(order.price_paid),
+            "external_id": order.external_id,
+            "completed_at": order.completed_at.isoformat() if order.completed_at else None
+        }
+        for order in local_orders
+    ]
 

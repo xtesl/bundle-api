@@ -1,4 +1,4 @@
-
+from sqlmodel.ext.asyncio.session import AsyncSession
 from datetime import datetime, timezone, timedelta
 import requests
 from typing import Any, Optional, Dict, Literal
@@ -7,6 +7,11 @@ from dotenv import load_dotenv
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from fastapi import Response
+import re
+from sqlmodel import select
+from unidecode import unidecode 
+from src.models.schemas import AgentStorefront
+
 
 load_dotenv()
 
@@ -144,6 +149,8 @@ def make_request(
     Returns:
         Parsed JSON response or raw text.
     """
+    response = None  # Initialize response here
+    
     try:
         response = requests.request(
             method, url,
@@ -158,32 +165,40 @@ def make_request(
         }
     
     except requests.exceptions.HTTPError as e:
-            # raise RuntimeError(f"""HTTP error: {response.status_code} -
-            #                    {response.text}""") from e
-            return {
-                "HTTP_ERROR": True,
-                "status_code": response.status_code,
-                "data": response.json()
-            }
-    
-    except requests.exceptions.JSONDecodeError:
+        # response is guaranteed to exist here because HTTPError only happens after request
         return {
             "HTTP_ERROR": True,
-            "status_code": response.status_code
+            "status_code": response.status_code,
+            "data": response.json() if response else None
+        }
+    
+    except requests.exceptions.JSONDecodeError:
+        # response exists but JSON parsing failed
+        return {
+            "HTTP_ERROR": True,
+            "status_code": response.status_code if response else None
         }
     
     except requests.exceptions.ConnectionError:
+        # Connection failed - response doesn't exist
         return {
             "CONNECTION_ERROR": True
         }
+    
     except ValueError:
-        # Return raw text if json parsing fails.
+        # Value error - response may or may not exist
         return {
-            # "text": response.text,
             "PARSE_ERROR": True,
-            "status_code": response.status_code
-            }
-
+            "status_code": response.status_code if response else None
+        }
+    
+    except Exception as e:
+        # Catch any other unexpected errors
+        return {
+            "ERROR": True,
+            "message": str(e),
+            "status_code": response.status_code if response else None
+        }
 
 
 
@@ -228,3 +243,59 @@ def get_hash(raw: str) -> str:
 
 def verify_hash(raw, hash) -> bool: 
     return pwd_context.verify(raw, hash)
+
+
+ 
+async def generate_slug_from_name(session: AsyncSession, name: str) -> str:
+    """
+    Generate a unique URL-safe slug from the agent's name.
+    
+    Args:
+        session: SQLModel AsyncSession
+        name: Agent's name or business name
+        
+    Returns:
+        A unique URL-safe slug
+        
+    Example:
+        "John's Data Store" -> "johns-data-store"
+        "MTN & Vodafone Hub" -> "mtn-vodafone-hub"
+        "Kwame's Shop" -> "kwames-shop"
+    """
+    # Convert to lowercase and remove accents
+    slug = unidecode(name).lower()
+    
+    # Replace spaces and special characters with hyphens
+    slug = re.sub(r'[^\w\s-]', '', slug)  # Remove special chars except spaces and hyphens
+    slug = re.sub(r'[-\s]+', '-', slug)    # Replace spaces/multiple hyphens with single hyphen
+    
+    # Remove leading/trailing hyphens
+    slug = slug.strip('-')
+    
+    # Ensure slug is not empty
+    if not slug:
+        raise ValueError("Cannot generate slug from empty name")
+    
+    # Check if slug exists and make it unique by appending numbers
+    original_slug = slug
+    counter = 1
+    
+    while True:
+        # Check if this slug already exists in database
+        statement = select(AgentStorefront).where(AgentStorefront.slug == slug)
+        result = await session.exec(statement)
+        existing = result.first()
+        
+        if not existing:
+            # Slug is unique, we can use it
+            break
+            
+        # Slug exists, try with counter
+        slug = f"{original_slug}-{counter}"
+        counter += 1
+    
+    return slug
+
+
+
+

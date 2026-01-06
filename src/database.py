@@ -7,6 +7,8 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 from sqlalchemy.orm import sessionmaker
 
+from src.models import schemas
+
 # Load env vars
 load_dotenv()
 

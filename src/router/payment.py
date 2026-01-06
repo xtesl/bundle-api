@@ -1,40 +1,235 @@
 from fastapi_utils.cbv import cbv
-from fastapi import APIRouter, status, Response, Request
+from fastapi import APIRouter, status, Response, Request, BackgroundTasks
 from fastapi.exceptions import HTTPException
+from decimal import Decimal
 
 
-from src.models.data import UserCreate, EmailUserLogin, UserPublic, InitializePayment
-from src.utils.database import get_object_or_404, save
-from src.utils.helpers import get_hash, verify_hash, set_del_auth_credentials, make_request
+from src.models.data import InitializePayment, BuyBundle, CreatePaymentRequest, BuyBundleFromAgent
+from src.utils.database import get_object_or_404, save, get_objects
+from src.utils.helpers import make_request
 from src.base_router import BaseRouter
-from src.models.schemas import User, Order
+from src.models.schemas import User, Order, Wallet, BundlePlan, PaymentRequest, Transaction
 from src.api.deps import CurrentUser
 
 
 api_router = APIRouter()
 
+async def save_model(session, model):
+    await save(session, model)
 
 @cbv(api_router)
 class PaymentRouter(BaseRouter):
-    @api_router.post('/initialize')
-    async def initialize(self, payment_data: InitializePayment, current_user: CurrentUser):
-        print(payment_data)
+    @api_router.post("/create-payment-request")
+    async def create_payment_request(self, data: CreatePaymentRequest, current_user: CurrentUser):
+        if current_user.role != 'agent':
+            raise HTTPException(
+                401,
+                "Unathorized Acess"
+            )
+
+        req = PaymentRequest(
+            agent_id=current_user.id,
+            email=current_user.email,
+            amount=Decimal(data.amount),
+            mobilemoney_name=data.mobilemoney_name,
+            receiver_number=data.receiver_number,
+            status="pending"
+        )
+
+        return await save(self.session, req, True)
+    
+    @api_router.get("/payment-requests")
+    async def get_requests(self, current_user: CurrentUser):
+        if current_user.role != "admin":
+            raise HTTPException(
+                401,
+                "Unathorized Access"
+            )
+        
+        return await get_objects(
+            self.session,
+            model=PaymentRequest,
+        )
+    
+    @api_router.get("/payment-requests/me")
+    async def get_my_requests(self, current_user: CurrentUser):
+        if current_user.role != "agent":
+            raise HTTPException(
+                401,
+                "Unathorized Access"
+            )
+        
+        return await get_objects(
+            self.session,
+            model=PaymentRequest,
+            filter_by=(PaymentRequest.agent_id, current_user.id)
+        )
+    
+
+    @api_router.post('/initialize-agent-purchase')
+    async def initialize_agent_purchase(self, data: BuyBundleFromAgent, current_user: CurrentUser):
+        plan = await get_object_or_404(
+            self.session,
+            where_attr=BundlePlan.id,
+            where_value=data.plan_id
+        )
+
+        transaction = Transaction(
+                amount=plan.base_price,
+                user_id=current_user.id,
+                transaction_type='purchase',
+                status="incomplete"
+        )
+        transaction =await save(self.session, transaction, True)
+      
+
         response = make_request(
             "POST", 
             "https://api.paystack.co/transaction/initialize",
              headers={
-                "Authorization": "Bearer sk_test_96ab3c5095600279d02b14295b3ecb7a36fe33cd"
+                "Authorization": "Bearer sk_test_50a9ecc1166c747f4253275bff1fb7ab8be0ea8b"
              },
             json={
-                "email": payment_data.email,
-                "amount": str(float(payment_data.amount) * 100),
+                "email": current_user.email,
+                "amount": str(float(plan.base_price) * 100),
                 "metadata": {
-                    "charge_for": payment_data.payment_for,
+                    "charge_for": data.payment_for,
                     "user_internal_id": current_user.id,
-                    "purchase_info": payment_data.purchase_info.model_dump()
+                    "agent_id": plan.creator_id,
+                    "beneficiary_number": data.beneficiary_number,
+                    "package_size": plan.value,
+                    "plan_id": plan.id,
+                    "price_paid": str(plan.base_price),
+                    "transaction_id": transaction.id
                 }
             }
         )
+
+        # print(response)
+        if response.get("status_code"):
+            if response["status_code"] == 200:
+                return response['data']
+        else:
+            raise HTTPException(
+                500,
+                "Something went wrong. Please try again."
+            )
+
+
+    @api_router.post("/buy-bundle")
+    async def buy(self, current_user: CurrentUser, data: BuyBundle, background_tasks: BackgroundTasks):
+        wallet = await get_object_or_404(
+            self.session,
+            where_attr=Wallet.user_id,
+            where_value=current_user.id,
+            res=False
+        )
+
+        plan = await get_object_or_404(
+            self.session,
+            where_attr=BundlePlan.id, 
+            where_value=data.plan_id
+        )
+
+        if wallet.balance < plan.base_price:
+            raise HTTPException(
+                402,
+                "Insufficient wallet balance. Please top up your wallet."
+            )
+        
+
+        res = make_request(
+                        "POST",
+                        "https://www.blessdatahub.com/api/create_order.php",
+                        headers={
+                            "Content-Type": "application/json", 
+                            "Authorization": "Bearer XUBeGct8zRgnaqMmlmGxZBOZ1zmKVHeI"
+                        },
+                        json=
+                           {
+                       "beneficiary": data.beneficiary_number,
+                       "package_size": data.package_size
+                       }
+                        
+                    )
+
+
+       
+
+        if res.get("status_code"):
+            if res["status_code"] == 201:
+                data = res["data"]["data"]
+                external_id = data["api_results"][0]["order_id"] 
+                status = data["api_results"][0]["status"] 
+                order = Order(
+                    user_id=current_user.id,
+                    plan_id=plan.id,
+                    beneficiary_number=data.beneficiary_number,
+                    price_paid=plan.base_price,
+                    external_id=external_id,
+                    status=status
+                )
+
+                order = await save(self.session, order, True)
+                wallet.balance = wallet.balance - plan.base_price
+                await save(self.session, wallet)
+
+                transaction = Transaction(
+                    amount=plan.base_price,
+                    transaction_type='purchase'
+                )
+                background_tasks.add_task(save_model, self.session, transaction)
+
+                return order
+
+            elif res["status_code"] == 402:
+                raise HTTPException(
+                    503,
+                    "Service Unavailable"
+                )
+            else:
+                raise HTTPException(
+                500,
+                "Something went wrong. Please try again or contact support."
+            )
+            
+        
+        else:
+            raise HTTPException(
+                500,
+                "Something went wrong. Please try again or contact support."
+            )
+        
+
+    
+    @api_router.get("/transactions/me")
+    async def get_transactions(self, current_user: CurrentUser):
+        return await get_objects(
+            self.session,
+            model=Transaction,
+            filter_by=(Transaction.user_id, current_user.id)
+        )
+
+       
+
+    @api_router.post('/initialize')
+    async def initialize(self, payment_data: InitializePayment, current_user: CurrentUser):
+        response = make_request(
+            "POST", 
+            "https://api.paystack.co/transaction/initialize",
+             headers={
+                "Authorization": "Bearer sk_test_50a9ecc1166c747f4253275bff1fb7ab8be0ea8b"
+             },
+            json={
+                "email": current_user.email,
+                "amount": str(float(payment_data.amount) * 100),
+                "metadata": {
+                    "charge_for": payment_data.payment_for,
+                    "user_internal_id": current_user.id
+                }
+            }
+        )
+
 
         if response.get("status_code"):
             if response["status_code"] == 200:
@@ -46,7 +241,7 @@ class PaymentRouter(BaseRouter):
             )
     
     @api_router.post("/verify")
-    async def verifyPayments(self, request: Request):
+    async def verifyPayments(self, request: Request, background_tasks: BackgroundTasks):
         """
         Webhook endpoint for payment verifications.
         """
@@ -55,8 +250,32 @@ class PaymentRouter(BaseRouter):
             if response["event"] == "charge.success":
                 payment_data = response["data"]
                 metadata = payment_data["metadata"]
-                if metadata.get("charge_for") == "agent-reg":
+                if metadata.get("charge_for") == "topup":
                     # Make user an agent
+                    user_id = metadata["user_internal_id"]
+                    wallet = await get_object_or_404(
+                        self.session,
+                        where_attr=Wallet.user_id,
+                        where_value=user_id,
+                        res=False
+                    )
+
+                    
+
+                    transaction = Transaction(
+                        amount=(Decimal(str(payment_data["amount"])) / 100) ,
+                        transaction_type='topup',
+                        user_id=user_id,
+                        reference=payment_data["reference"]
+                     )
+
+                    background_tasks.add_task(save_model, self.session, transaction)
+
+                    wallet.balance = wallet.balance + (Decimal(str(payment_data["amount"])) / 100)
+                    await save(self.session, wallet)
+
+                
+                if metadata.get("charge_for") == "agent_reg":
                     user_id = metadata["user_internal_id"]
                     user = await get_object_or_404(
                         self.session,
@@ -64,33 +283,88 @@ class PaymentRouter(BaseRouter):
                         where_value=user_id,
                         res=False
                     )
-                    user.user_type = 'agent'
+
+                    transaction = Transaction(
+                        amount=(Decimal(str(payment_data["amount"])) / 100) ,
+                        transaction_type='purchase',
+                        user_id=user_id,
+                        reference=payment_data["reference"]
+                     )
+
+                    background_tasks.add_task(save_model, self.session, transaction)
+
+
+                    user.role = "agent"
                     await save(self.session, user)
-                
-                if metadata.get("charge_for") == "purchase":
+            
+
+                if metadata.get("charge_for") == "buy-bundle":
                     user_id = metadata["user_internal_id"]
-                    purchase_info = metadata["purchase_info"]
-                    # Create order on instantgh
-                    response = make_request(
+                    package_size = metadata["package_size"]
+                    beneficiary_number = metadata["beneficiary_number"]
+                    plan_id = metadata["plan_id"]
+                    base_price = metadata["price_paid"]
+                    agent_id = metadata["agent_id"]
+
+                    trns = await get_object_or_404(
+                        self.session,
+                        where_attr=Transaction.id,
+                        where_value=metadata["transaction_id"]
+                    )
+                    trns.status = 'complete'
+
+                    background_tasks.add_task(save_model, self.session, trns)
+                    
+                    res = make_request(
                         "POST",
-                        "https://instantdatagh.com/api.php/orders",
+                        "https://www.blessdatahub.com/api/create_order.php",
                         headers={
                             "Content-Type": "application/json", 
-                            "x-api-key": "api_4a78faae8724e4aeabcd60e9892caca25cfc2b0e04b733ad10459f62b455366d"
+                            "Authorization": "Bearer XUBeGct8zRgnaqMmlmGxZBOZ1zmKVHeI"
                         },
-                        json={
-                            "network": purchase_info.network_name,
-                            "phone_number": purchase_info.beneficiary_number,
-                            "data_amount": purchase_info.data_amount
-                        }
-                    )
-                    
-                    if response.get("status_code"):
+                        json=
+                           {
+                       "beneficiary": beneficiary_number,
+                       "package_size": package_size
+                       }
                         
-                        validated_purchase_info = Order.model_validate(purchase_info, update={
-                                                                      "customer_id": user_id
-                                                         })
-                        await save(self.session, validated_purchase_info, False)
+                    )
 
+                    # print(res)
+                    
 
+                    if res.get("status_code"):
+                        if res["status_code"] == 201:
+                            data = res["data"]["data"]
+                            external_id = data["api_results"][0]["order_id"] 
+                            status = data["api_results"][0]["status"] 
+                            order = Order(
+                                 user_id=user_id,
+                                 plan_id=plan_id,
+                                 agent_id=agent_id,
+                                 beneficiary_number=beneficiary_number,
+                                 price_paid=base_price,
+                                 external_id=external_id,
+                                 status=status
+                            )
+                            
+                            await save(self.session, order, True)
+                    
+
+                            
+
+                        
+
+                        
+            
+            
         
+        
+
+
+                
+                        
+                    
+                    
+                    
+           
