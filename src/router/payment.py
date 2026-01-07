@@ -68,11 +68,24 @@ class PaymentRouter(BaseRouter):
 
     @api_router.post('/initialize-agent-purchase')
     async def initialize_agent_purchase(self, data: BuyBundleFromAgent, current_user: CurrentUser):
+
         plan = await get_object_or_404(
             self.session,
             where_attr=BundlePlan.id,
             where_value=data.plan_id
         )
+
+        agent_wallet = await get_object_or_404(
+            self.session,
+            where_attr=Wallet.user_id,
+            where_value=plan.agent_id
+        )
+
+        if agent_wallet.balance < plan.base_price:
+            raise HTTPException(
+                402,
+                "Service Unavailable"
+            )
 
         transaction = Transaction(
                 amount=plan.base_price,
@@ -87,7 +100,7 @@ class PaymentRouter(BaseRouter):
             "POST", 
             "https://api.paystack.co/transaction/initialize",
              headers={
-                "Authorization": "Bearer sk_test_50a9ecc1166c747f4253275bff1fb7ab8be0ea8b"
+                "Authorization": "Bearer sk_live_28ba29a72a3feec4da308f4155cb8611f19f901f"
              },
             json={
                 "email": current_user.email,
@@ -218,7 +231,7 @@ class PaymentRouter(BaseRouter):
             "POST", 
             "https://api.paystack.co/transaction/initialize",
              headers={
-                "Authorization": "Bearer sk_test_50a9ecc1166c747f4253275bff1fb7ab8be0ea8b"
+                "Authorization": "Bearer sk_live_28ba29a72a3feec4da308f4155cb8611f19f901f"
              },
             json={
                 "email": current_user.email,
@@ -347,8 +360,18 @@ class PaymentRouter(BaseRouter):
                                  external_id=external_id,
                                  status=status
                             )
+
+                            agent_wallet = get_object_or_404(
+                                self.session,
+                                where_attr=Wallet.id,
+                                where_value=agent_id
+                            )
+                            agent_wallet.balance = agent_wallet.balance - Decimal(base_price)
+
+                            background_tasks.add_task(save_model, self.session, agent_wallet)
                             
                             await save(self.session, order, True)
+                            
                     
 
                             
